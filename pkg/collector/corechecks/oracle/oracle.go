@@ -99,6 +99,7 @@ type Check struct {
 	statementsLastRun                       time.Time
 	dbInstanceLastRun                       time.Time
 	tablespaceLastRun                       time.Time
+	schemasLastRun                          time.Time
 	lastSnapshotID                          int64
 	filePath                                string
 	sqlTraceRunsCount                       int
@@ -281,6 +282,14 @@ func (c *Check) Run() error {
 		err := c.Tablespaces()
 		if err != nil {
 			allErrors = errors.Join(allErrors, fmt.Errorf("%s failed to collect tablespaces %w", c.logPrompt, err))
+		}
+	}
+
+	if c.config.Schemas.Enabled && (c.dbmEnabled || c.config.DataObservability.Enabled) &&
+		checkIntervalExpired(&c.schemasLastRun, c.config.Schemas.CollectionInterval) {
+		err := c.SchemaCollection()
+		if err != nil {
+			allErrors = errors.Join(allErrors, fmt.Errorf("%s failed to collect schemas %w", c.logPrompt, err))
 		}
 	}
 
