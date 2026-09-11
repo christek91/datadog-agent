@@ -99,6 +99,7 @@ type Check struct {
 	statementsLastRun                       time.Time
 	dbInstanceLastRun                       time.Time
 	tablespaceLastRun                       time.Time
+	lastSnapshotID                          int64
 	filePath                                string
 	sqlTraceRunsCount                       int
 	sqlSubstringLength                      int
