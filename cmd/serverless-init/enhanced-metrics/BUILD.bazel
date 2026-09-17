@@ -23,6 +23,8 @@ go_library(
             "//pkg/util/log",
             "//pkg/util/pointer",
             "//pkg/util/system",
+            "@com_github_shirou_gopsutil_v4//common",
+            "@com_github_shirou_gopsutil_v4//cpu",
         ],
         "@rules_go//go/platform:darwin": [
             "//pkg/metrics",
@@ -48,6 +50,8 @@ go_library(
             "//pkg/util/log",
             "//pkg/util/pointer",
             "//pkg/util/system",
+            "@com_github_shirou_gopsutil_v4//common",
+            "@com_github_shirou_gopsutil_v4//cpu",
         ],
         "@rules_go//go/platform:netbsd": [
             "//pkg/metrics",
@@ -86,6 +90,7 @@ dd_agent_go_test(
             "//pkg/metrics",
             "//pkg/util/cgroups",
             "//pkg/util/pointer",
+            "@com_github_shirou_gopsutil_v4//cpu",
             "@com_github_stretchr_testify//assert",
             "@com_github_stretchr_testify//mock",
             "@com_github_stretchr_testify//require",
@@ -94,6 +99,7 @@ dd_agent_go_test(
             "//pkg/metrics",
             "//pkg/util/cgroups",
             "//pkg/util/pointer",
+            "@com_github_shirou_gopsutil_v4//cpu",
             "@com_github_stretchr_testify//assert",
             "@com_github_stretchr_testify//mock",
             "@com_github_stretchr_testify//require",

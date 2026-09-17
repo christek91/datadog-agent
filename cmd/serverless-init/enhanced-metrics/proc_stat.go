@@ -8,48 +8,51 @@
 package enhancedmetrics
 
 import (
-	"bufio"
-	"bytes"
+	"context"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
-	"strconv"
-	"strings"
+	"math"
 	"time"
+
+	gopsutilcommon "github.com/shirou/gopsutil/v4/common"
+	"github.com/shirou/gopsutil/v4/cpu"
 
 	"github.com/DataDog/datadog-agent/pkg/util/pointer"
 )
 
-const (
-	procStatClockTicksPerSecond = 100
-	procStatNanosecondsPerTick  = uint64(time.Second) / procStatClockTicksPerSecond
-	maxUint64                   = ^uint64(0)
-)
+const maxUint64 = ^uint64(0)
 
 type procStatCPUStatsProvider struct {
-	path     string
-	cpuCount int
-	readFile func(string) ([]byte, error)
+	procPath    string
+	cpuCount    int
+	getCPUTimes func(context.Context, bool) ([]cpu.TimesStat, error)
 }
 
 func newProcStatCPUStatsProvider(procPath string, cpuCount int) *procStatCPUStatsProvider {
 	return &procStatCPUStatsProvider{
-		path:     filepath.Join(procPath, "stat"),
-		cpuCount: cpuCount,
-		readFile: os.ReadFile,
+		procPath:    procPath,
+		cpuCount:    cpuCount,
+		getCPUTimes: cpu.TimesWithContext,
 	}
 }
 
 func (p *procStatCPUStatsProvider) read(collectionTime time.Time) (*ServerlessContainerStats, error) {
-	data, err := p.readFile(p.path)
+	ctx := context.WithValue(
+		context.Background(),
+		gopsutilcommon.EnvKey,
+		gopsutilcommon.EnvMap{gopsutilcommon.HostProcEnvKey: p.procPath},
+	)
+	times, err := p.getCPUTimes(ctx, false)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read %s: %w", p.path, err)
+		return nil, fmt.Errorf("failed to read %s/stat: %w", p.procPath, err)
+	}
+	if len(times) == 0 {
+		return nil, fmt.Errorf("failed to read %s/stat: no aggregate CPU stats returned", p.procPath)
 	}
 
-	total, err := parseProcStatCPUTime(data)
+	total, err := cpuTimesToNanoseconds(times[0])
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse %s: %w", p.path, err)
+		return nil, fmt.Errorf("failed to convert CPU stats from %s/stat: %w", p.procPath, err)
 	}
 
 	cpuStats := &ServerlessCPUStats{Total: pointer.Ptr(total)}
@@ -65,41 +68,21 @@ func (p *procStatCPUStatsProvider) read(collectionTime time.Time) (*ServerlessCo
 	}, nil
 }
 
-// parseProcStatCPUTime returns aggregate guest CPU busy time in nanoseconds.
-// /proc/stat reports USER_HZ ticks. User, nice, system, irq, and softirq are
-// counted; iowait and steal are excluded because they are not time executing
-// guest work. Guest and guest_nice are not added because Linux already includes
-// them in user and nice, respectively.
-func parseProcStatCPUTime(data []byte) (uint64, error) {
-	scanner := bufio.NewScanner(bytes.NewReader(data))
-	for scanner.Scan() {
-		fields := strings.Fields(scanner.Text())
-		if len(fields) == 0 || fields[0] != "cpu" {
-			continue
-		}
-		if len(fields) < 8 {
-			return 0, fmt.Errorf("aggregate cpu line has %d fields, want at least 8", len(fields))
-		}
-
-		var busyTicks uint64
-		for _, index := range []int{1, 2, 3, 6, 7} {
-			ticks, err := strconv.ParseUint(fields[index], 10, 64)
-			if err != nil {
-				return 0, fmt.Errorf("invalid cpu counter %q: %w", fields[index], err)
-			}
-			if busyTicks > maxUint64-ticks {
-				return 0, errors.New("aggregate cpu counter overflow")
-			}
-			busyTicks += ticks
-		}
-
-		if busyTicks > maxUint64/procStatNanosecondsPerTick {
-			return 0, errors.New("aggregate cpu time conversion overflow")
-		}
-		return busyTicks * procStatNanosecondsPerTick, nil
+// cpuTimesToNanoseconds returns aggregate guest CPU busy time in nanoseconds.
+// User, nice, system, irq, and softirq are counted; idle, iowait, and steal
+// are excluded because they are not time executing guest work. Guest and
+// guest_nice are not added because Linux already includes them in user and
+// nice, respectively.
+func cpuTimesToNanoseconds(stats cpu.TimesStat) (uint64, error) {
+	busyNanoseconds := (stats.User + stats.Nice + stats.System + stats.Irq + stats.Softirq) * float64(time.Second)
+	if math.IsNaN(busyNanoseconds) || math.IsInf(busyNanoseconds, 0) || busyNanoseconds < 0 {
+		return 0, errors.New("invalid aggregate CPU time")
 	}
-	if err := scanner.Err(); err != nil {
-		return 0, err
+
+	busyNanoseconds = math.Round(busyNanoseconds)
+	if busyNanoseconds >= float64(maxUint64) {
+		return 0, errors.New("aggregate CPU time conversion overflow")
 	}
-	return 0, errors.New("aggregate cpu line not found")
+
+	return uint64(busyNanoseconds), nil
 }

@@ -8,52 +8,70 @@
 package enhancedmetrics
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"testing"
-	"time"
-
 	"github.com/DataDog/datadog-agent/pkg/metrics"
 	"github.com/DataDog/datadog-agent/pkg/util/cgroups"
 	"github.com/DataDog/datadog-agent/pkg/util/pointer"
+	"github.com/shirou/gopsutil/v4/cpu"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"math"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
 )
 
-func TestParseProcStatCPUTime(t *testing.T) {
-	data := []byte("cpu 10 20 30 40 50 60 70 80 90 100 110\ncpu0 1 2 3 4 5 6 7 8 9 10 11\n")
+func TestCPUTimesToNanoseconds(t *testing.T) {
+	total, err := cpuTimesToNanoseconds(cpu.TimesStat{
+		User:    0.1,
+		Nice:    0.2,
+		System:  0.3,
+		Iowait:  0.4,
+		Irq:     0.5,
+		Softirq: 0.6,
+		Steal:   0.7,
+		Guest:   0.8,
+	})
 
-	total, err := parseProcStatCPUTime(data)
-
-	assert.NoError(t, err)
-	assert.Equal(t, uint64(1.9e9), total)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(1.7e9), total)
 }
 
-func TestParseProcStatCPUTimeRejectsMalformedInput(t *testing.T) {
-	tests := []struct {
-		name string
-		data []byte
-	}{
-		{name: "missing aggregate line", data: []byte("cpu0 1 2 3 4 5 6 7\n")},
-		{name: "short aggregate line", data: []byte("cpu 1 2 3\n")},
-		{name: "invalid counter", data: []byte("cpu 1 x 3 4 5 6 7\n")},
+func TestCPUTimesToNanosecondsRejectsInvalidInput(t *testing.T) {
+	for _, stats := range []cpu.TimesStat{
+		{User: math.NaN()},
+		{User: math.Inf(1)},
+		{User: -1},
+		{User: 2e10},
+	} {
+		_, err := cpuTimesToNanoseconds(stats)
+		assert.Error(t, err)
 	}
+}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			_, err := parseProcStatCPUTime(tt.data)
-			assert.Error(t, err)
-		})
-	}
+func TestCPUTimesToNanosecondsRounds(t *testing.T) {
+	total, err := cpuTimesToNanoseconds(cpu.TimesStat{User: 1.5e-9})
+
+	require.NoError(t, err)
+	assert.Equal(t, uint64(2), total)
 }
 
 func TestProcStatCPUStatsProviderRead(t *testing.T) {
 	provider := &procStatCPUStatsProvider{
-		path:     "/tmp/proc/stat",
+		procPath: "/tmp/proc",
 		cpuCount: 2,
-		readFile: func(string) ([]byte, error) {
-			return []byte("cpu 10 20 30 40 50 60 70 80 90 100 110\n"), nil
+		getCPUTimes: func(context.Context, bool) ([]cpu.TimesStat, error) {
+			return []cpu.TimesStat{{
+				User:    0.1,
+				Nice:    0.2,
+				System:  0.3,
+				Irq:     0.6,
+				Softirq: 0.7,
+			}}, nil
 		},
 	}
 
@@ -64,12 +82,61 @@ func TestProcStatCPUStatsProviderRead(t *testing.T) {
 	assert.Equal(t, 2e9, *stats.CPU.Limit)
 }
 
+func TestProcStatCPUStatsProviderReadsConfiguredProcPath(t *testing.T) {
+	procPath := t.TempDir()
+	require.NoError(t, os.WriteFile(
+		filepath.Join(procPath, "stat"),
+		[]byte("cpu 10 20 30 40 50 60 70 80\n"),
+		0o644,
+	))
+
+	provider := newProcStatCPUStatsProvider(procPath, 0)
+	stats, err := provider.read(time.Unix(100, 0))
+
+	require.NoError(t, err)
+	assert.Equal(t, uint64(math.Round(190/cpu.ClocksPerSec*float64(time.Second))), *stats.CPU.Total)
+	assert.Nil(t, stats.CPU.Limit)
+}
+
+func TestProcStatCPUStatsProviderRejectsInvalidProcStat(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+	}{
+		{name: "short aggregate line", data: "cpu 1 2 3\n"},
+		{name: "invalid counter", data: "cpu 1 x 3 4 5 6 7\n"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			procPath := t.TempDir()
+			require.NoError(t, os.WriteFile(filepath.Join(procPath, "stat"), []byte(tt.data), 0o644))
+
+			provider := newProcStatCPUStatsProvider(procPath, 0)
+			_, err := provider.read(time.Unix(100, 0))
+
+			assert.Error(t, err)
+		})
+	}
+}
+
 func TestProcStatCPUStatsProviderReadUnavailable(t *testing.T) {
 	provider := &procStatCPUStatsProvider{
-		path: "/tmp/proc/stat",
-		readFile: func(string) ([]byte, error) {
+		procPath: "/tmp/proc",
+		getCPUTimes: func(context.Context, bool) ([]cpu.TimesStat, error) {
 			return nil, errors.New("unavailable")
 		},
+	}
+
+	_, err := provider.read(time.Unix(100, 0))
+
+	assert.Error(t, err)
+}
+
+func TestProcStatCPUStatsProviderReadEmpty(t *testing.T) {
+	provider := &procStatCPUStatsProvider{
+		procPath:    "/tmp/proc",
+		getCPUTimes: func(context.Context, bool) ([]cpu.TimesStat, error) { return nil, nil },
 	}
 
 	_, err := provider.read(time.Unix(100, 0))
@@ -115,10 +182,16 @@ func TestProcStatCPUUsageAfterTwoSamples(t *testing.T) {
 	t0 := time.Unix(100, 0)
 	t1 := t0.Add(time.Second)
 	provider := &procStatCPUStatsProvider{
-		path:     "/tmp/proc/stat",
+		procPath: "/tmp/proc",
 		cpuCount: 1,
-		readFile: func(string) ([]byte, error) {
-			return []byte("cpu 110 20 30 40 50 60 70 80 90 100 110\n"), nil
+		getCPUTimes: func(context.Context, bool) ([]cpu.TimesStat, error) {
+			return []cpu.TimesStat{{
+				User:    1.1,
+				Nice:    0.2,
+				System:  0.3,
+				Irq:     0.6,
+				Softirq: 0.7,
+			}}, nil
 		},
 	}
 	collector := &Collector{}
@@ -126,8 +199,14 @@ func TestProcStatCPUUsageAfterTwoSamples(t *testing.T) {
 	assert.NoError(t, err)
 	collector.computeEnhancedMetrics(first)
 
-	provider.readFile = func(string) ([]byte, error) {
-		return []byte("cpu 120 30 40 40 50 60 80 90 100 110 120\n"), nil
+	provider.getCPUTimes = func(context.Context, bool) ([]cpu.TimesStat, error) {
+		return []cpu.TimesStat{{
+			User:    1.2,
+			Nice:    0.3,
+			System:  0.4,
+			Irq:     0.7,
+			Softirq: 0.7,
+		}}, nil
 	}
 	second, err := provider.read(t1)
 	assert.NoError(t, err)
@@ -171,10 +250,16 @@ func TestProcStatCollectorEmitsLimitOnFirstSample(t *testing.T) {
 	metricAgent := new(mockEnhancedMetricSender)
 	metricAgent.On("AddEnhancedMetric", "aws.lambda.microvm.enhanced.cpu.limit", 2e9, metrics.MetricSourceAWSMicroVMEnhanced, mock.Anything, []string(nil)).Return()
 	provider := &procStatCPUStatsProvider{
-		path:     "/tmp/proc/stat",
+		procPath: "/tmp/proc",
 		cpuCount: 2,
-		readFile: func(string) ([]byte, error) {
-			return []byte("cpu 10 20 30 40 50 60 70 80 90 100 110\n"), nil
+		getCPUTimes: func(context.Context, bool) ([]cpu.TimesStat, error) {
+			return []cpu.TimesStat{{
+				User:    0.1,
+				Nice:    0.2,
+				System:  0.3,
+				Irq:     0.6,
+				Softirq: 0.7,
+			}}, nil
 		},
 	}
 	collector := &Collector{
