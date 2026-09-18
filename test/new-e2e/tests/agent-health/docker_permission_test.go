@@ -60,6 +60,7 @@ func (suite *dockerPermissionSuite) TestDockerHealthCheckTransientFailure() {
 	agent := suite.Env().Agent
 	fakeIntake := suite.Env().Fakeintake.Client()
 
+	// issueID is a prefix: the actual id is scoped by a host discriminator, e.g. "docker-socket-permissions:<host>".
 	const issueID = "docker-socket-permissions"
 
 	// Pre-condition: docker socket must be restricted so the issue is active.
@@ -70,7 +71,7 @@ func (suite *dockerPermissionSuite) TestDockerHealthCheckTransientFailure() {
 		assert.NoError(ct, err)
 		var found bool
 		for _, p := range payloads {
-			for _, iss := range findIssuesByID(suite.T(), p, issueID) {
+			for _, iss := range findIssuesByPrefix(p, issueID) {
 				if iss.PersistedIssue != nil {
 					found = true
 				}
@@ -102,7 +103,7 @@ func (suite *dockerPermissionSuite) TestDockerHealthCheckTransientFailure() {
 		assert.NoError(ct, err)
 		reloadedIssues = nil
 		for _, p := range payloads {
-			for _, iss := range findIssuesByID(suite.T(), p, issueID) {
+			for _, iss := range findIssuesByPrefix(p, issueID) {
 				if iss.PersistedIssue != nil &&
 					(iss.PersistedIssue.State == healthplatform.IssueState_ISSUE_STATE_ACTIVE) {
 					reloadedIssues = append(reloadedIssues, iss)
@@ -125,6 +126,7 @@ func (suite *dockerPermissionSuite) TestDockerPermissionIssueLifecycle() {
 	agent := suite.Env().Agent
 	fakeIntake := suite.Env().Fakeintake.Client()
 
+	// issueID is a prefix: the actual id is scoped by a host discriminator, e.g. "docker-socket-permissions:<host>".
 	const issueID = "docker-socket-permissions"
 
 	containers, err := suite.Env().Docker.Client.ListContainers()
@@ -147,7 +149,7 @@ func (suite *dockerPermissionSuite) TestDockerPermissionIssueLifecycle() {
 			assert.NoError(ct, err)
 			issues = nil
 			for _, p := range payloads {
-				for _, iss := range findIssuesByID(t, p, issueID) {
+				for _, iss := range findIssuesByPrefix(p, issueID) {
 					if iss.PersistedIssue != nil && iss.PersistedIssue.State == healthplatform.IssueState_ISSUE_STATE_ACTIVE {
 						issues = append(issues, iss)
 					}
@@ -158,7 +160,7 @@ func (suite *dockerPermissionSuite) TestDockerPermissionIssueLifecycle() {
 
 		require.NotEmpty(t, issues)
 		issue := issues[0]
-		assert.Equal(t, "docker-socket-permissions", issue.Id)
+		assert.True(t, strings.HasPrefix(issue.Id, issueID+":"), "issue id %q should be scoped by host discriminator", issue.Id)
 		assert.Equal(t, "Docker Socket Permission", issue.IssueName)
 		assert.Equal(t, "docker_socket_permission", issue.IssueType)
 		assert.Equal(t, "permissions", issue.Category)
@@ -190,7 +192,122 @@ func (suite *dockerPermissionSuite) TestDockerPermissionIssueLifecycle() {
 			payloads, err := fakeIntake.GetAgentHealth()
 			assert.NoError(ct, err)
 			for _, p := range payloads {
-				for _, iss := range findIssuesByID(t, p, issueID) {
+				for _, iss := range findIssuesByPrefix(p, issueID) {
+					if iss.PersistedIssue != nil && iss.PersistedIssue.State == healthplatform.IssueState_ISSUE_STATE_RESOLVED {
+						return
+					}
+				}
+			}
+			assert.Fail(ct, "no payload found with the issue in RESOLVED state")
+		}, defaultIssueTimeout, defaultIssuePollInterval, "issue never transitioned to RESOLVED after fix")
+	})
+}
+
+// TestDockerSocketUnavailableLifecycle verifies a stale, non-permission-denied Docker socket is reported as "Docker Socket Unavailable" (ACTIVE), and that restoring it resolves the issue.
+func (suite *dockerPermissionSuite) TestDockerSocketUnavailableLifecycle() {
+	host := suite.Env().RemoteHost
+	agent := suite.Env().Agent
+	fakeIntake := suite.Env().Fakeintake.Client()
+
+	// issueID is a prefix: the actual id is scoped by a host discriminator, e.g. "docker-socket-unavailable:<hash>".
+	const issueID = "docker-socket-unavailable"
+
+	// breakSocket stops the Docker daemon and leaves a stale, world-writable socket file with nothing listening, so dialing it returns "connection refused".
+	breakSocket := func() {
+		host.MustExecute("sudo systemctl stop docker.socket docker.service || true")
+		host.MustExecute("sudo rm -f /var/run/docker.sock")
+		host.MustExecute(`sudo python3 -c "import socket; s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.bind('/var/run/docker.sock'); s.listen(1)"`)
+		host.MustExecute("sudo chmod 666 /var/run/docker.sock")
+	}
+
+	// restoreSocket removes the stale socket file and restarts docker.socket/docker.service, then chmods the
+	// recreated socket to world-writable since systemd's docker.socket unit defaults to a restricted mode
+	// (e.g. 660, group docker) that dd-agent may not otherwise have access to.
+	// Stopping the daemon also stops the suite's busybox "spam" containers (their compose manifest has no
+	// restart policy), so they are restarted explicitly too — restarting the daemon alone won't bring them back.
+	restoreSocket := func() {
+		host.MustExecute("sudo rm -f /var/run/docker.sock")
+		host.MustExecute("sudo systemctl restart docker.socket docker.service")
+		host.MustExecute("sudo chmod 666 /var/run/docker.sock")
+		host.MustExecute(`sudo sh -c 'docker ps -aq --filter "name=spam" --filter "status=exited" | xargs -r docker start'`)
+	}
+
+	restartAgent := func(t *testing.T) {
+		require.NoError(t, agent.Client.Restart())
+		require.EventuallyWithT(t, func(ct *assert.CollectT) {
+			assert.True(ct, agent.Client.IsReady())
+		}, 2*time.Minute, 10*time.Second, "agent not ready after restart")
+	}
+
+	t := suite.T()
+
+	// Cleanup restores the daemon (not re-breaks it) since a stopped daemon
+	// would break other tests' busybox containers. Registered up front, and
+	// setup/teardown kept outside the subtests below, so IssueDetection and
+	// Resolution can each be run independently (e.g. via -run).
+	t.Cleanup(func() {
+		restoreSocket()
+		restartAgent(t)
+	})
+
+	// Fakeintake retains payloads across retries on the same infrastructure: reset it so a
+	// stale ACTIVE payload from an earlier attempt can't satisfy IssueDetection below.
+	require.NoError(t, fakeIntake.FlushServerAndResetAggregators())
+
+	breakSocket()
+	restartAgent(t)
+
+	t.Run("IssueDetection", func(t *testing.T) {
+		var issues []*healthplatform.Issue
+		require.EventuallyWithT(t, func(ct *assert.CollectT) {
+			payloads, err := fakeIntake.GetAgentHealth()
+			assert.NoError(ct, err)
+			issues = nil
+			for _, p := range payloads {
+				for _, iss := range findIssuesByPrefix(p, issueID) {
+					if iss.PersistedIssue != nil && iss.PersistedIssue.State == healthplatform.IssueState_ISSUE_STATE_ACTIVE {
+						issues = append(issues, iss)
+					}
+				}
+			}
+			assert.NotEmpty(ct, issues, "docker socket unavailable issue not found as ACTIVE in fakeintake")
+		}, defaultIssueTimeout, defaultIssuePollInterval, "docker socket unavailable issue not detected as ACTIVE in fakeintake")
+
+		require.NotEmpty(t, issues)
+		issue := issues[0]
+		assert.True(t, strings.HasPrefix(issue.Id, issueID+":"), "issue id %q should be scoped by host discriminator", issue.Id)
+		assert.Equal(t, "Docker Socket Unavailable", issue.IssueName)
+		assert.Equal(t, "docker_socket_unavailable", issue.IssueType)
+		assert.Equal(t, "availability", issue.Category)
+		assert.Equal(t, "logs-agent", issue.Location)
+		assert.Equal(t, "agent", issue.Source)
+		assert.Contains(t, issue.Tags, "docker-socket")
+		assert.Contains(t, issue.Tags, "unavailable")
+		require.NotNil(t, issue.Remediation, "remediation should be provided")
+		assert.NotEmpty(t, issue.Remediation.Summary)
+		assert.NotEmpty(t, issue.Remediation.Steps)
+	})
+
+	// Reset again so a stale RESOLVED payload from an earlier attempt can't satisfy
+	// Resolution below without the current lifecycle actually completing.
+	require.NoError(t, fakeIntake.FlushServerAndResetAggregators())
+
+	restoreSocket()
+
+	// Verify the daemon is genuinely accessible before asserting recovery below — otherwise a socket
+	// still restricted to a permission-denied state would make the "unavailable" issue resolve for the
+	// wrong reason (replaced by a "permission" issue) without Docker access ever actually being restored.
+	perm := host.MustExecute("stat -c '%a' /var/run/docker.sock")
+	assert.Contains(t, strings.TrimSpace(perm), "666", "docker socket should be world-accessible after restoreSocket")
+
+	restartAgent(t)
+
+	t.Run("Resolution", func(t *testing.T) {
+		require.EventuallyWithT(t, func(ct *assert.CollectT) {
+			payloads, err := fakeIntake.GetAgentHealth()
+			assert.NoError(ct, err)
+			for _, p := range payloads {
+				for _, iss := range findIssuesByPrefix(p, issueID) {
 					if iss.PersistedIssue != nil && iss.PersistedIssue.State == healthplatform.IssueState_ISSUE_STATE_RESOLVED {
 						return
 					}
